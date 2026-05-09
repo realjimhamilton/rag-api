@@ -147,6 +147,7 @@ class Contextualizer:
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
             temperature=0.0,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
 
         input_tokens = getattr(response.usage, "prompt_tokens", 0) or 0
