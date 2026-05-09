@@ -81,6 +81,25 @@ MONGO_VECTOR_COLLECTION = get_env_variable(
 CHUNK_SIZE = int(get_env_variable("CHUNK_SIZE", "1500"))
 CHUNK_OVERLAP = int(get_env_variable("CHUNK_OVERLAP", "100"))
 
+# Contextual retrieval — prepend LLM-generated context to each chunk before
+# embedding. Disabled by default; flip to true once deployed and verified.
+CONTEXTUAL_RETRIEVAL_ENABLED = get_env_variable(
+    "CONTEXTUAL_RETRIEVAL_ENABLED", "False"
+).lower() in ("true", "1", "yes", "on")
+CONTEXTUALIZER_PROVIDER = get_env_variable("CONTEXTUALIZER_PROVIDER", "anthropic")
+CONTEXTUALIZER_MODEL = get_env_variable(
+    "CONTEXTUALIZER_MODEL", "claude-haiku-4-5-20251001"
+)
+ANTHROPIC_API_KEY = get_env_variable("ANTHROPIC_API_KEY", "")
+CONTEXTUALIZER_API_KEY = get_env_variable("CONTEXTUALIZER_API_KEY", "") or ANTHROPIC_API_KEY
+CONTEXTUALIZER_BASE_URL = get_env_variable("CONTEXTUALIZER_BASE_URL", None)
+CONTEXTUALIZER_MAX_CONCURRENCY = int(
+    get_env_variable("CONTEXTUALIZER_MAX_CONCURRENCY", "5")
+)
+MAX_CHUNKS_PER_CONTEXTUALIZE = int(
+    get_env_variable("MAX_CHUNKS_PER_CONTEXTUALIZE", "200")
+)
+
 # Batch processing configuration for memory-constrained environments.
 # When EMBEDDING_BATCH_SIZE > 0, documents are processed in batches to reduce
 # peak memory usage. This is useful for Kubernetes pods with memory limits.

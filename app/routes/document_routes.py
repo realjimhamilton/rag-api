@@ -41,7 +41,15 @@ from app.config import (
     EMBEDDING_BATCH_SIZE,
     EMBEDDING_MAX_QUEUE_SIZE,
     RAG_DISTANCE_THRESHOLD,
+    CONTEXTUAL_RETRIEVAL_ENABLED,
+    CONTEXTUALIZER_PROVIDER,
+    CONTEXTUALIZER_MODEL,
+    CONTEXTUALIZER_API_KEY,
+    CONTEXTUALIZER_BASE_URL,
+    CONTEXTUALIZER_MAX_CONCURRENCY,
+    MAX_CHUNKS_PER_CONTEXTUALIZE,
 )
+from app.services.contextualizer import Contextualizer
 
 # Warn once at import time if the user set a threshold under Atlas, where
 # the score direction is inverted (Atlas vectorSearchScore: higher = better)
@@ -84,6 +92,7 @@ from app.models import (
     QueryRequestBody,
     DocumentResponse,
     QueryMultipleBody,
+    ContextualizeRequestBody,
 )
 from app.services.vector_store.async_pg_vector import AsyncPgVector
 from app.utils.document_loader import (
@@ -732,16 +741,39 @@ async def store_data_in_vector_db(
     clean_content: bool = False,
     executor=None,
 ) -> bool:
+    # Materialize so we can read twice (prep + full text for contextualizer)
+    data_list = list(data)
+
     # Run document preparation in executor to avoid blocking the event loop
     loop = asyncio.get_running_loop()
     docs = await loop.run_in_executor(
         executor,
         _prepare_documents_sync,
-        data,
+        data_list,
         file_id,
         user_id,
         clean_content,
     )
+
+    # Contextual retrieval: prepend LLM-generated context to each chunk
+    if CONTEXTUAL_RETRIEVAL_ENABLED and docs:
+        try:
+            full_text = "\n\n".join(doc.page_content for doc in data_list)
+            ctx = Contextualizer(
+                provider=CONTEXTUALIZER_PROVIDER,
+                model=CONTEXTUALIZER_MODEL,
+                api_key=CONTEXTUALIZER_API_KEY,
+                base_url=CONTEXTUALIZER_BASE_URL,
+                max_concurrency=CONTEXTUALIZER_MAX_CONCURRENCY,
+                max_chunks=MAX_CHUNKS_PER_CONTEXTUALIZE,
+            )
+            docs = await ctx.contextualize_documents(full_text, docs, file_id)
+        except Exception as e:
+            logger.error(
+                "Contextualization failed for file %s, proceeding with raw chunks: %s",
+                file_id,
+                str(e),
+            )
 
     try:
         if EMBEDDING_BATCH_SIZE <= 0:
@@ -1178,3 +1210,192 @@ async def extract_text_from_file(
             )
     finally:
         await cleanup_temp_file_async(validated_temp_file_path)
+
+
+@router.post("/contextualize/{file_id}")
+async def contextualize_file(
+    file_id: str,
+    request: Request,
+    body: ContextualizeRequestBody = None,
+):
+    """
+    Contextualize existing chunks for a file. Prepends LLM-generated context
+    to each chunk, then re-embeds. Accepts optional provider/model overrides
+    for backfill (e.g. Kimi K2.6 on DeepInfra instead of Haiku).
+    """
+    body = body or ContextualizeRequestBody()
+
+    try:
+        executor = request.app.state.thread_pool
+
+        if isinstance(vector_store, AsyncPgVector):
+            existing_ids = await vector_store.get_filtered_ids(
+                [file_id], executor=executor
+            )
+            documents = await vector_store.get_documents_by_ids(
+                [file_id], executor=executor
+            )
+        else:
+            existing_ids = vector_store.get_filtered_ids([file_id])
+            documents = vector_store.get_documents_by_ids([file_id])
+
+        if file_id not in existing_ids or not documents:
+            raise HTTPException(
+                status_code=404, detail="File not found in vector store"
+            )
+
+        already_done = sum(
+            1 for d in documents if d.metadata.get("is_contextualized")
+        )
+        if already_done == len(documents):
+            return {
+                "status": True,
+                "message": "All chunks already contextualized",
+                "file_id": file_id,
+                "chunks": len(documents),
+                "skipped": True,
+            }
+
+        if body.full_text:
+            full_text = body.full_text
+        else:
+            full_text = "\n\n".join(d.page_content for d in documents)
+
+        provider = body.provider or CONTEXTUALIZER_PROVIDER
+        model = body.model or CONTEXTUALIZER_MODEL
+        api_key = body.api_key or CONTEXTUALIZER_API_KEY
+        base_url = body.base_url or CONTEXTUALIZER_BASE_URL
+
+        ctx = Contextualizer(
+            provider=provider,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            max_concurrency=CONTEXTUALIZER_MAX_CONCURRENCY,
+            max_chunks=MAX_CHUNKS_PER_CONTEXTUALIZE,
+        )
+
+        lc_docs = [
+            Document(page_content=d.page_content, metadata=d.metadata)
+            for d in documents
+        ]
+        contextualized = await ctx.contextualize_documents(
+            full_text, lc_docs, file_id
+        )
+
+        if isinstance(vector_store, AsyncPgVector):
+            await vector_store.delete(ids=[file_id], executor=executor)
+            await vector_store.aadd_documents(
+                contextualized,
+                ids=[file_id] * len(contextualized),
+                executor=executor,
+            )
+        else:
+            vector_store.delete(ids=[file_id])
+            vector_store.add_documents(
+                contextualized, ids=[file_id] * len(contextualized)
+            )
+
+        return {
+            "status": True,
+            "message": "File contextualized and re-embedded",
+            "file_id": file_id,
+            "chunks": len(contextualized),
+            "provider": provider,
+            "model": model,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "Error contextualizing file %s: %s\n%s",
+            file_id,
+            str(e),
+            traceback.format_exc(),
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/decontextualize/{file_id}")
+async def decontextualize_file(file_id: str, request: Request):
+    """
+    Remove context prefixes from a file's chunks and re-embed with the
+    original text. Rollback mechanism for contextualization.
+    """
+    try:
+        executor = request.app.state.thread_pool
+
+        if isinstance(vector_store, AsyncPgVector):
+            existing_ids = await vector_store.get_filtered_ids(
+                [file_id], executor=executor
+            )
+            documents = await vector_store.get_documents_by_ids(
+                [file_id], executor=executor
+            )
+        else:
+            existing_ids = vector_store.get_filtered_ids([file_id])
+            documents = vector_store.get_documents_by_ids([file_id])
+
+        if file_id not in existing_ids or not documents:
+            raise HTTPException(
+                status_code=404, detail="File not found in vector store"
+            )
+
+        restored = []
+        restored_count = 0
+        for d in documents:
+            meta = dict(d.metadata) if d.metadata else {}
+            original = meta.pop("original_chunk_text", None)
+
+            if original and meta.get("is_contextualized"):
+                restored_count += 1
+                meta.pop("is_contextualized", None)
+                meta.pop("contextualized_at", None)
+                meta.pop("contextualizer_model", None)
+                restored.append(
+                    Document(page_content=original, metadata=meta)
+                )
+            else:
+                restored.append(
+                    Document(page_content=d.page_content, metadata=meta)
+                )
+
+        if restored_count == 0:
+            return {
+                "status": True,
+                "message": "No contextualized chunks found",
+                "file_id": file_id,
+                "chunks": len(documents),
+                "restored": 0,
+            }
+
+        if isinstance(vector_store, AsyncPgVector):
+            await vector_store.delete(ids=[file_id], executor=executor)
+            await vector_store.aadd_documents(
+                restored, ids=[file_id] * len(restored), executor=executor
+            )
+        else:
+            vector_store.delete(ids=[file_id])
+            vector_store.add_documents(
+                restored, ids=[file_id] * len(restored)
+            )
+
+        return {
+            "status": True,
+            "message": "File decontextualized and re-embedded",
+            "file_id": file_id,
+            "chunks": len(restored),
+            "restored": restored_count,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "Error decontextualizing file %s: %s\n%s",
+            file_id,
+            str(e),
+            traceback.format_exc(),
+        )
+        raise HTTPException(status_code=500, detail=str(e))

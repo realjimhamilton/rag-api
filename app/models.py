@@ -42,3 +42,11 @@ class QueryMultipleBody(BaseModel):
     query: str
     file_ids: List[str]
     k: int = 4
+
+
+class ContextualizeRequestBody(BaseModel):
+    full_text: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
