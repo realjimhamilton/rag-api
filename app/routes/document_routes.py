@@ -740,6 +740,7 @@ async def store_data_in_vector_db(
     user_id: str = "",
     clean_content: bool = False,
     executor=None,
+    skip_contextualize: bool = False,
 ) -> bool:
     # Materialize so we can read twice (prep + full text for contextualizer)
     data_list = list(data)
@@ -756,7 +757,7 @@ async def store_data_in_vector_db(
     )
 
     # Contextual retrieval: prepend LLM-generated context to each chunk
-    if CONTEXTUAL_RETRIEVAL_ENABLED and docs:
+    if CONTEXTUAL_RETRIEVAL_ENABLED and docs and not skip_contextualize:
         try:
             full_text = "\n\n".join(doc.page_content for doc in data_list)
             ctx = Contextualizer(
@@ -892,6 +893,7 @@ async def embed_file(
     file_id: str = Form(...),
     file: UploadFile = File(...),
     entity_id: str = Form(None),
+    skip_contextualize: str = Form(None),
 ):
     response_status = True
     response_message = "File processed successfully."
@@ -923,6 +925,7 @@ async def embed_file(
             user_id=user_id,
             clean_content=file_ext == "pdf",
             executor=request.app.state.thread_pool,
+            skip_contextualize=skip_contextualize in ("true", "1", "yes", True),
         )
 
         if not result:
