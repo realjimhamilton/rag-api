@@ -21,7 +21,10 @@ from fastapi import (
     status,
 )
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import (
+    MarkdownHeaderTextSplitter,
+    RecursiveCharacterTextSplitter,
+)
 from functools import lru_cache
 import asyncio
 
@@ -48,6 +51,8 @@ from app.config import (
     CONTEXTUALIZER_BASE_URL,
     CONTEXTUALIZER_MAX_CONCURRENCY,
     MAX_CHUNKS_PER_CONTEXTUALIZE,
+    MARKDOWN_AWARE_CHUNKING,
+    MARKDOWN_HEADERS_TO_SPLIT_ON,
 )
 from app.services.contextualizer import Contextualizer
 
@@ -699,20 +704,130 @@ def generate_digest(page_content: str) -> str:
     return hashlib.md5(page_content.encode("utf-8", "ignore")).hexdigest()
 
 
+def _split_markdown_aware(data: Iterable[Document]) -> List[Document]:
+    """
+    Header-aware split for markdown files. Splits the joined page content by
+    H2/H3 (configurable via MARKDOWN_HEADERS_TO_SPLIT_ON) so each section
+    becomes its own Document. Oversized sections then get a secondary pass
+    through RecursiveCharacterTextSplitter so the chunk_size budget is still
+    honored.
+
+    The full header path is prepended to each chunk's page_content (and kept
+    on metadata.section_header) so it ends up in the embedding. That's the
+    load-bearing reason this exists: a query for "Client Presentation
+    module" then matches chunks whose first line literally says
+    "Modules > Client Presentation", rather than competing semantically
+    against unrelated text that happens to use the same words.
+
+    Fallback: if MARKDOWN_HEADERS_TO_SPLIT_ON parsed to an empty list (every
+    token was malformed) or the document has no recognized headers, this
+    returns the data passed through RecursiveCharacterTextSplitter so we
+    never produce zero chunks.
+    """
+    full_text = "\n\n".join(
+        (doc.page_content or "") for doc in data if doc and doc.page_content
+    )
+    if not full_text.strip() or not MARKDOWN_HEADERS_TO_SPLIT_ON:
+        return RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+        ).split_documents(list(data))
+
+    # strip_headers=True drops the literal "## Title" / "### Title" lines
+    # from each section body. We re-add the header context ourselves below
+    # as a single bracketed line at the top of each chunk
+    # ("[Parent > Child]") so the embedding sees one clean header signal
+    # with full parent context, instead of the raw markdown marker for
+    # one level only.
+    header_splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=MARKDOWN_HEADERS_TO_SPLIT_ON,
+        strip_headers=True,
+    )
+    header_chunks = header_splitter.split_text(full_text)
+
+    if not header_chunks:
+        return RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+        ).split_documents(list(data))
+
+    # Secondary pass: any single section larger than chunk_size still needs
+    # to be split. RecursiveCharacterTextSplitter on the docs preserves the
+    # MarkdownHeaderTextSplitter's metadata onto every sub-chunk.
+    char_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+    )
+
+    out: List[Document] = []
+    for chunk in header_chunks:
+        # MarkdownHeaderTextSplitter returns Documents whose metadata is the
+        # accumulated header path (e.g. {"Header 2": "Modules",
+        # "Header 3": "Client Presentation"}). Build a single human-readable
+        # header_path string for the prepended line + searchable metadata
+        # field. Order matters — preserve the configured header hierarchy
+        # rather than dict iteration order so "Modules > Client Presentation"
+        # isn't accidentally rendered "Client Presentation > Modules" when
+        # both keys exist.
+        header_meta = chunk.metadata or {}
+        ordered_headers = [
+            header_meta.get(label)
+            for (_marker, label) in MARKDOWN_HEADERS_TO_SPLIT_ON
+            if header_meta.get(label)
+        ]
+        header_path = " > ".join(ordered_headers) if ordered_headers else None
+        # Prepend the header path as a bracketed line so every chunk's
+        # embedding includes the section title (and parent context, for
+        # nested H3s). The raw "## Title" line was stripped by
+        # MarkdownHeaderTextSplitter above; this bracketed form is the
+        # canonical replacement.
+        if header_path:
+            body = f"[{header_path}]\n{chunk.page_content}"
+        else:
+            body = chunk.page_content
+
+        # Promote header path onto metadata for downstream consumers (the
+        # Node-side fileSearch already passes metadata through verbatim, so
+        # tool output gains "section: Modules > Client Presentation" with no
+        # additional plumbing).
+        new_metadata = dict(header_meta)
+        if header_path:
+            new_metadata["section_header"] = header_path
+
+        if len(body) <= CHUNK_SIZE:
+            out.append(Document(page_content=body, metadata=new_metadata))
+            continue
+
+        # Section is oversized — split it further and tag every sub-chunk
+        # with the same header metadata so the section context survives.
+        sub_chunks = char_splitter.split_documents(
+            [Document(page_content=body, metadata=new_metadata)]
+        )
+        out.extend(sub_chunks)
+
+    return out
+
+
 def _prepare_documents_sync(
     data: Iterable[Document],
     file_id: str,
     user_id: str,
     clean_content: bool,
+    file_ext: Optional[str] = None,
 ) -> List[Document]:
     """
     Synchronous document preparation - runs in executor to avoid blocking event loop.
     Handles text splitting, cleaning, and metadata preparation.
+
+    For markdown files (file_ext == "md") with MARKDOWN_AWARE_CHUNKING enabled,
+    routes through the header-aware splitter so each ##/### section becomes
+    its own chunk. All other file types use the existing
+    RecursiveCharacterTextSplitter path.
     """
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
-    )
-    documents = text_splitter.split_documents(data)
+    if MARKDOWN_AWARE_CHUNKING and file_ext == "md":
+        documents = _split_markdown_aware(data)
+    else:
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+        )
+        documents = text_splitter.split_documents(data)
 
     # If `clean_content` is True, clean the page_content of each document (remove null bytes)
     if clean_content:
@@ -741,6 +856,7 @@ async def store_data_in_vector_db(
     clean_content: bool = False,
     executor=None,
     skip_contextualize: bool = False,
+    file_ext: Optional[str] = None,
 ) -> bool:
     # Materialize so we can read twice (prep + full text for contextualizer)
     data_list = list(data)
@@ -754,6 +870,7 @@ async def store_data_in_vector_db(
         file_id,
         user_id,
         clean_content,
+        file_ext,
     )
 
     # Contextual retrieval: prepend LLM-generated context to each chunk
@@ -848,6 +965,7 @@ async def embed_local_file(
             user_id,
             clean_content=file_ext == "pdf",
             executor=request.app.state.thread_pool,
+            file_ext=file_ext,
         )
 
         if result:
@@ -926,6 +1044,7 @@ async def embed_file(
             clean_content=file_ext == "pdf",
             executor=request.app.state.thread_pool,
             skip_contextualize=skip_contextualize in ("true", "1", "yes", True),
+            file_ext=file_ext,
         )
 
         if not result:
@@ -1062,6 +1181,7 @@ async def embed_file_upload(
             user_id,
             clean_content=file_ext == "pdf",
             executor=request.app.state.thread_pool,
+            file_ext=file_ext,
         )
 
         if not result:

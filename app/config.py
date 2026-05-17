@@ -81,6 +81,64 @@ MONGO_VECTOR_COLLECTION = get_env_variable(
 CHUNK_SIZE = int(get_env_variable("CHUNK_SIZE", "1500"))
 CHUNK_OVERLAP = int(get_env_variable("CHUNK_OVERLAP", "100"))
 
+# Markdown-aware chunking.
+#
+# When enabled, .md files are first split by header boundaries
+# (MarkdownHeaderTextSplitter), then any oversized sections are further
+# split by RecursiveCharacterTextSplitter as a secondary pass. The full
+# header path (e.g. "Modules > Client Presentation") is prepended to each
+# chunk's page_content so it ends up in the embedding — a query for "Client
+# Presentation module" then maps cleanly onto chunks from that specific
+# section rather than competing semantically against unrelated text that
+# happens to mention "client" or "presentation."
+#
+# Defaults to True because the only files this affects are markdown, and
+# header-aware chunking is strictly better than character-counted chunking
+# for any markdown document with meaningful headers. Set
+# MARKDOWN_AWARE_CHUNKING=false to fall back to RecursiveCharacterTextSplitter
+# for .md files (e.g. for a deploy that doesn't want the behavior change,
+# or to A/B compare retrieval quality).
+MARKDOWN_AWARE_CHUNKING = get_env_variable(
+    "MARKDOWN_AWARE_CHUNKING", "True"
+).lower() in ("true", "1", "yes", "on")
+
+# Header levels to treat as split boundaries. Comma-separated, in order of
+# nesting depth. Defaults to "H2,H3" — H1 is typically the document title
+# (not a section boundary) and H4+ is usually too fine-grained to justify
+# splitting into its own chunk. Override to "H1,H2,H3" if your markdown
+# docs use # for sections rather than ##.
+def _parse_md_headers(raw: str) -> list[tuple[str, str]]:
+    """Parse the env var into the (marker, metadata_key) list that
+    MarkdownHeaderTextSplitter expects. e.g. 'H2,H3' →
+    [('##', 'Header 2'), ('###', 'Header 3')]. Unknown tokens are dropped
+    with a warning rather than crashing the service at boot. The module-
+    level `logger` is defined further down in this file (post-app
+    construction), so we use the stdlib logger directly here to avoid an
+    import-order trap."""
+    marker_by_level = {
+        "H1": ("#", "Header 1"),
+        "H2": ("##", "Header 2"),
+        "H3": ("###", "Header 3"),
+        "H4": ("####", "Header 4"),
+        "H5": ("#####", "Header 5"),
+        "H6": ("######", "Header 6"),
+    }
+    out = []
+    for token in (t.strip().upper() for t in raw.split(",")):
+        if token in marker_by_level:
+            out.append(marker_by_level[token])
+        elif token:
+            logging.getLogger(__name__).warning(
+                "MARKDOWN_HEADERS_TO_SPLIT_ON: ignoring unknown header token %r "
+                "(expected one of H1-H6)", token,
+            )
+    return out
+
+
+MARKDOWN_HEADERS_TO_SPLIT_ON = _parse_md_headers(
+    get_env_variable("MARKDOWN_HEADERS_TO_SPLIT_ON", "H2,H3")
+)
+
 # Contextual retrieval — prepend LLM-generated context to each chunk before
 # embedding. Disabled by default; flip to true once deployed and verified.
 CONTEXTUAL_RETRIEVAL_ENABLED = get_env_variable(
