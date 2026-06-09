@@ -92,6 +92,33 @@ class TestSplitMarkdownAware:
         for c in chunks:
             assert c.metadata.get("section_header") is None
 
+    def test_source_metadata_survives_header_split(self):
+        # Regression: MarkdownHeaderTextSplitter splits the JOINED text and
+        # returns header-only metadata, so `source` was being dropped on every
+        # header chunk (fileSearch derives the citation label from it). Every
+        # chunk must carry the original file's source forward. See the
+        # source-less-chunks incident (1,313 chunks, all markdown-aware path).
+        src = "/app/uploads/u1/module-library_abc123.md"
+        chunks = _split_markdown_aware(
+            [Document(page_content=MODULE_LIBRARY_FIXTURE, metadata={"source": src})]
+        )
+        assert chunks
+        for c in chunks:
+            assert c.metadata.get("source") == src
+
+    def test_oversized_section_subchunks_keep_source(self):
+        # The secondary RecursiveCharacterTextSplitter pass must not lose
+        # source either — every sub-chunk of an oversized section keeps it.
+        src = "/app/uploads/u1/big_def456.md"
+        big_body = "lorem ipsum dolor sit amet. " * 200
+        oversize_md = f"## Big Section\n\n{big_body}\n"
+        chunks = _split_markdown_aware(
+            [Document(page_content=oversize_md, metadata={"source": src})]
+        )
+        assert len(chunks) > 1
+        for c in chunks:
+            assert c.metadata.get("source") == src
+
 
 class TestPrepareDocumentsSync:
     def test_md_file_uses_header_aware_path(self):
@@ -113,6 +140,21 @@ class TestPrepareDocumentsSync:
             assert d.metadata["file_id"] == "f1"
             assert d.metadata["user_id"] == "u1"
             assert d.metadata["digest"]
+
+    def test_md_path_preserves_source_metadata(self):
+        # End-to-end through the prepare step: a .md file's source must reach
+        # the stored chunk metadata so the citation label is correct.
+        src = "/app/uploads/u1/module-library_abc123.md"
+        docs = _prepare_documents_sync(
+            data=[Document(page_content=MODULE_LIBRARY_FIXTURE, metadata={"source": src})],
+            file_id="f1",
+            user_id="u1",
+            clean_content=False,
+            file_ext="md",
+        )
+        assert docs
+        for d in docs:
+            assert d.metadata.get("source") == src
 
     def test_non_md_file_uses_recursive_split(self):
         # A .txt file with the same content should NOT carry section_header
