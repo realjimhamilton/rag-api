@@ -756,6 +756,20 @@ def _split_markdown_aware(data: Iterable[Document]) -> List[Document]:
         chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
     )
 
+    # MarkdownHeaderTextSplitter splits the JOINED full_text, so each chunk it
+    # returns carries ONLY its header-path metadata (e.g. {"Header 2": ...}).
+    # The original per-file metadata — notably `source`, which fileSearch uses
+    # to derive the citation label — is dropped. (The two fallback returns
+    # above go through split_documents(), which preserves doc.metadata, so they
+    # don't hit this.) Capture the base metadata from the input docs once and
+    # merge it under the header keys on every chunk so source/attribution
+    # survives the header-aware split, matching the non-markdown path.
+    base_meta: dict = {}
+    for _d in data:
+        if _d and _d.metadata:
+            base_meta = dict(_d.metadata)
+            break
+
     out: List[Document] = []
     for chunk in header_chunks:
         # MarkdownHeaderTextSplitter returns Documents whose metadata is the
@@ -787,7 +801,7 @@ def _split_markdown_aware(data: Iterable[Document]) -> List[Document]:
         # Node-side fileSearch already passes metadata through verbatim, so
         # tool output gains "section: Modules > Client Presentation" with no
         # additional plumbing).
-        new_metadata = dict(header_meta)
+        new_metadata = {**base_meta, **header_meta}
         if header_path:
             new_metadata["section_header"] = header_path
 
