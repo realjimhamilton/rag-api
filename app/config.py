@@ -28,6 +28,7 @@ class EmbeddingsProvider(Enum):
     BEDROCK = "bedrock"
     GOOGLE_GENAI = "google_genai"
     GOOGLE_VERTEXAI = "vertexai"
+    VOYAGE = "voyage"
 
 
 def get_env_variable(
@@ -297,6 +298,7 @@ GOOGLE_KEY = get_env_variable("GOOGLE_KEY", GOOGLE_API_KEY)
 RAG_GOOGLE_API_KEY = get_env_variable("RAG_GOOGLE_API_KEY", GOOGLE_KEY)
 AWS_SESSION_TOKEN = get_env_variable("AWS_SESSION_TOKEN", "")
 GOOGLE_APPLICATION_CREDENTIALS = get_env_variable("GOOGLE_APPLICATION_CREDENTIALS", "")
+VOYAGE_API_KEY = get_env_variable("VOYAGE_API_KEY", "")
 env_value = get_env_variable("RAG_CHECK_EMBEDDING_CTX_LENGTH", "True").lower()
 RAG_CHECK_EMBEDDING_CTX_LENGTH = True if env_value == "true" else False
 
@@ -391,6 +393,19 @@ def init_embeddings(provider, model, dimensions=None):
             model_id=model,
             region_name=AWS_DEFAULT_REGION,
         )
+    elif provider == EmbeddingsProvider.VOYAGE:
+        # Native contextualized-chunk embeddings (voyage-context-4/3). Replaces the
+        # separate LLM contextualizer — the model encodes the whole document in one
+        # pass. See app/services/voyage_contextual.py.
+        from app.services.voyage_contextual import VoyageContextualizedEmbeddings
+
+        return VoyageContextualizedEmbeddings(
+            api_key=VOYAGE_API_KEY,
+            model=model,
+            output_dimension=VOYAGE_OUTPUT_DIMENSION,
+            output_dtype=VOYAGE_OUTPUT_DTYPE,
+            max_tokens_per_request=VOYAGE_MAX_TOKENS_PER_REQUEST,
+        )
     else:
         raise ValueError(f"Unsupported embeddings provider: {provider}")
 
@@ -438,8 +453,23 @@ elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.BEDROCK:
         "EMBEDDINGS_MODEL", "amazon.titan-embed-text-v1"
     )
     AWS_DEFAULT_REGION = get_env_variable("AWS_DEFAULT_REGION", "us-east-1")
+elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.VOYAGE:
+    EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "voyage-context-4")
+    # voyage-context-* output dims: 2048, 1024 (default), 512, 256. First cut is
+    # 1024/float — smaller than text-embedding-3-small's 1536, full precision.
+    # int8/binary + 512 are later storage/speed levers (need pgvector halfvec/bit).
+    VOYAGE_OUTPUT_DIMENSION = int(get_env_variable("VOYAGE_OUTPUT_DIMENSION", "1024"))
+    VOYAGE_OUTPUT_DTYPE = get_env_variable("VOYAGE_OUTPUT_DTYPE", "float")
+    VOYAGE_MAX_TOKENS_PER_REQUEST = int(
+        get_env_variable("VOYAGE_MAX_TOKENS_PER_REQUEST", "28000")
+    )
 else:
     raise ValueError(f"Unsupported embeddings provider: {EMBEDDINGS_PROVIDER}")
+
+# True when the active embeddings provider contextualizes natively (Voyage). The
+# store path reads this to (1) skip the redundant LLM contextualizer and (2) keep
+# each file's chunks in a single embed call so the model sees them as one document.
+IS_VOYAGE_CONTEXTUAL = EMBEDDINGS_PROVIDER == EmbeddingsProvider.VOYAGE
 
 embeddings = init_embeddings(
     EMBEDDINGS_PROVIDER, EMBEDDINGS_MODEL, dimensions=EMBEDDINGS_DIMENSIONS

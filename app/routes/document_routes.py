@@ -45,6 +45,7 @@ from app.config import (
     EMBEDDING_MAX_QUEUE_SIZE,
     RAG_DISTANCE_THRESHOLD,
     CONTEXTUAL_RETRIEVAL_ENABLED,
+    IS_VOYAGE_CONTEXTUAL,
     CONTEXTUALIZER_PROVIDER,
     CONTEXTUALIZER_MODEL,
     CONTEXTUALIZER_API_KEY,
@@ -887,8 +888,18 @@ async def store_data_in_vector_db(
         file_ext,
     )
 
-    # Contextual retrieval: prepend LLM-generated context to each chunk
-    if CONTEXTUAL_RETRIEVAL_ENABLED and docs and not skip_contextualize:
+    # Contextual retrieval: prepend LLM-generated context to each chunk.
+    # Skipped for the Voyage provider — voyage-context-* contextualizes natively
+    # inside the embedding call, so an LLM prepend is redundant (and would have the
+    # model re-contextualize already-contextualized text).
+    if IS_VOYAGE_CONTEXTUAL:
+        if CONTEXTUAL_RETRIEVAL_ENABLED and docs and not skip_contextualize:
+            logger.debug(
+                "Skipping LLM contextualizer for file %s — Voyage contextual "
+                "embeddings handle this natively.",
+                file_id,
+            )
+    elif CONTEXTUAL_RETRIEVAL_ENABLED and docs and not skip_contextualize:
         try:
             full_text = "\n\n".join(doc.page_content for doc in data_list)
             ctx = Contextualizer(
@@ -908,7 +919,11 @@ async def store_data_in_vector_db(
             )
 
     try:
-        if EMBEDDING_BATCH_SIZE <= 0:
+        # Voyage contextual embeddings need the whole file's chunks in ONE embed
+        # call so the model contextualizes them as a single document; the batched
+        # pipeline would split a >batch-size file across embed calls and break
+        # per-chunk contextualization. Force the single-shot path for Voyage.
+        if EMBEDDING_BATCH_SIZE <= 0 or IS_VOYAGE_CONTEXTUAL:
             # synchronously embed the file and insert into vector store in one go
             if isinstance(vector_store, AsyncPgVector):
                 ids = await vector_store.aadd_documents(
