@@ -122,3 +122,44 @@ def test_empty_documents_returns_empty():
 def test_missing_api_key_raises():
     with pytest.raises(ValueError):
         VoyageContextualizedEmbeddings(api_key="")
+
+
+class _RejectingVoyageClient:
+    """Rejects any group larger than ``max_group`` with voyage's real 32K-token
+    error, so embed_documents must recursively split. Records every group size it
+    is asked to embed (including the rejected attempts)."""
+
+    def __init__(self, max_group):
+        self.max_group = max_group
+        self.calls = []
+
+    def contextualized_embed(
+        self, inputs, model, input_type, output_dtype="float", output_dimension=None
+    ):
+        group = inputs[0]
+        self.calls.append(len(group))
+        if len(group) > self.max_group:
+            raise Exception(
+                "Request to model 'voyage-context-4' failed. The example at index 0 "
+                "in your batch has too many tokens and does not fit into the model's "
+                "context window of 32000 tokens"
+            )
+        dim = output_dimension or 4
+        embeddings = [[float(len(group[i]))] + [0.0] * (dim - 1) for i in range(len(group))]
+        return _FakeResponse([_FakeResult(embeddings)])
+
+
+def test_over_token_limit_recursively_splits_and_keeps_order():
+    # Dense content: a group voyage rejects for exceeding the 32K-token document
+    # limit must be halved until each piece fits, without dropping or reordering.
+    client = _RejectingVoyageClient(max_group=3)
+    emb = _make_embedder(client, output_dimension=4, max_tokens_per_request=10**9)
+    texts = [chr(ord("a") + i) * (i + 1) for i in range(10)]  # distinct lengths 1..10
+
+    vectors = emb.embed_documents(texts)
+
+    assert len(vectors) == 10
+    assert [v[0] for v in vectors] == [float(i + 1) for i in range(10)]  # order preserved
+    # every SUCCESSFUL (non-raising) call embedded a group within the limit
+    successful = [n for n in client.calls if n <= 3]
+    assert sum(successful) == 10 and all(n <= 3 for n in successful)
