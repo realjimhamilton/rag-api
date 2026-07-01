@@ -33,13 +33,16 @@ from langchain_core.embeddings import Embeddings
 
 logger = logging.getLogger(__name__)
 
-# Conservative per-request token budget for pre-chunked document inputs. MongoDB's
-# docs state pre-chunked inputs must stay under 32K tokens per request; we leave
-# headroom. Tunable via VOYAGE_MAX_TOKENS_PER_REQUEST. Token count is estimated as
-# chars/4 (same convention the LibreChat side uses); chunks are tiny relative to
-# this budget (CHUNK_SIZE=1500 chars ~ 375 tokens), so single-chunk overflow is a
-# non-issue.
-DEFAULT_MAX_TOKENS_PER_REQUEST = 28_000
+# Per-document token budget for pre-chunked contextualized inputs. voyage-context
+# rejects any document group over 32K tokens ("too many tokens ... does not fit
+# into the model's context window of 32000 tokens", with no truncation). We batch
+# by an ESTIMATE (chars/4), which badly underestimates dense content such as CSVs,
+# spreadsheets, non-English text, and transcripts: a group estimated at ~14K can be
+# over 32K real tokens. So the estimate is only a first cut. embed_documents
+# catches the hard 32K error and recursively splits the group until it fits. Keep
+# this well under 32K so the split rarely triggers on normal prose. Tunable via
+# VOYAGE_MAX_TOKENS_PER_REQUEST.
+DEFAULT_MAX_TOKENS_PER_REQUEST = 16_000
 
 
 def _estimate_tokens(text: str) -> int:
@@ -129,6 +132,43 @@ class VoyageContextualizedEmbeddings(Embeddings):
             raise RuntimeError("Voyage contextualized_embed result missing 'embeddings'")
         return embeddings
 
+    def _embed_group(self, client, group: List[str]) -> List[List[float]]:
+        """Embed one contextualized group, recursively halving it if voyage rejects
+        it for exceeding the 32K-token per-document limit. The chars/4 pre-estimate
+        underestimates dense content, so a group can still be over the hard cap; on
+        that specific error we split and retry each half. A single chunk is bounded
+        by the rag-api chunk size so recursion terminates. Splitting means the two
+        halves are contextualized separately, an acceptable degradation for an
+        oversized document versus failing the whole file."""
+        try:
+            response = client.contextualized_embed(
+                inputs=[group],  # one document group: one inner list of ordered chunks
+                **self._kwargs("document"),
+            )
+            emb = self._extract_group_embeddings(response)
+            if len(emb) != len(group):
+                raise RuntimeError(
+                    f"Voyage returned {len(emb)} vectors for {len(group)} chunks; "
+                    "refusing to store a misaligned set."
+                )
+            return emb
+        except Exception as e:
+            msg = str(e).lower()
+            over_limit = "too many tokens" in msg or "context window" in msg
+            if over_limit and len(group) > 1:
+                mid = len(group) // 2
+                logger.warning(
+                    "Voyage contextual: a group of %d chunks exceeded the 32K-token "
+                    "document limit; splitting into %d + %d and retrying.",
+                    len(group),
+                    mid,
+                    len(group) - mid,
+                )
+                return self._embed_group(client, group[:mid]) + self._embed_group(
+                    client, group[mid:]
+                )
+            raise
+
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         if not texts:
             return []
@@ -137,7 +177,7 @@ class VoyageContextualizedEmbeddings(Embeddings):
         batches = self._batch_by_token_budget(texts)
         if len(batches) > 1:
             logger.info(
-                "Voyage contextual: document has %d chunks exceeding the %d-token "
+                "Voyage contextual: document has %d chunks over the %d-token "
                 "per-request budget; split into %d contextualized groups (context "
                 "preserved within each group, not across).",
                 len(texts),
@@ -147,17 +187,7 @@ class VoyageContextualizedEmbeddings(Embeddings):
 
         vectors: List[List[float]] = []
         for batch in batches:
-            response = client.contextualized_embed(
-                inputs=[batch],  # one document group → one inner list of ordered chunks
-                **self._kwargs("document"),
-            )
-            group = self._extract_group_embeddings(response)
-            if len(group) != len(batch):
-                raise RuntimeError(
-                    f"Voyage contextualized_embed returned {len(group)} vectors for "
-                    f"{len(batch)} chunks; refusing to store a misaligned set."
-                )
-            vectors.extend(group)
+            vectors.extend(self._embed_group(client, batch))
 
         if len(vectors) != len(texts):
             raise RuntimeError(
