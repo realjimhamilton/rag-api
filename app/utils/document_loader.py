@@ -1,6 +1,7 @@
 # app/utils/document_loader.py
 
 import os
+import re
 import codecs
 import tempfile
 
@@ -191,6 +192,44 @@ def clean_text(text: str) -> str:
     text = remove_null(text)
     text = remove_non_utf8(text)
     return text
+
+
+# Inline base64 image blobs from markdown/HTML exports (e.g. Google Docs
+# "download as Markdown") are pure noise to an embedding model: it cannot decode
+# a text-encoded image, and a single blob is often hundreds of KB, which crowds
+# real text out of the chunks. The LibreChat side already strips these from the
+# prompt-inlined text (packages/api/src/files/text.ts stripBase64Images); this is
+# the same strip for the embed path, which extracts the raw file independently.
+# Each blob becomes a short "[image]" placeholder (keeping markdown alt text).
+_MD_IMG_DATA_URI = re.compile(
+    r"!\[([^\]]*)\]\(\s*data:[^)]*?base64,[A-Za-z0-9+/=]+[^)]*\)", re.IGNORECASE
+)
+_HTML_IMG_DATA_URI = re.compile(
+    r"<img\b[^>]*\bsrc=[\"']?data:[^>]*?base64,[A-Za-z0-9+/=]+[^>]*>", re.IGNORECASE
+)
+_BARE_DATA_URI = re.compile(
+    r"data:[a-z0-9.+-]+/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+", re.IGNORECASE
+)
+
+
+def strip_base64_images(text: str) -> str:
+    """Replace inline base64 image data URIs with a short ``[image]`` placeholder.
+
+    Handles markdown ``![alt](data:...;base64,...)``, HTML ``<img src=data:...>``,
+    and bare data-URI blobs. A cheap ``"base64,"`` membership check short-circuits
+    the common case (no data URIs) so this is nearly free on normal documents.
+    """
+    if not text or "base64," not in text:
+        return text or ""
+
+    def _md_repl(match: "re.Match") -> str:
+        alt = (match.group(1) or "").strip()
+        return f"[image: {alt}]" if alt else "[image]"
+
+    out = _MD_IMG_DATA_URI.sub(_md_repl, text)
+    out = _HTML_IMG_DATA_URI.sub("[image]", out)
+    out = _BARE_DATA_URI.sub("[image]", out)
+    return out
 
 
 def remove_null(text: str) -> str:

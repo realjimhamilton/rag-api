@@ -104,6 +104,7 @@ from app.services.vector_store.async_pg_vector import AsyncPgVector
 from app.utils.document_loader import (
     get_loader,
     clean_text,
+    strip_base64_images,
     process_documents,
     cleanup_temp_encoding_file,
 )
@@ -836,6 +837,15 @@ def _prepare_documents_sync(
     its own chunk. All other file types use the existing
     RecursiveCharacterTextSplitter path.
     """
+    # Strip inline base64 image blobs from the raw text BEFORE chunking, so a
+    # multi-KB data URI can't be split across chunks and survive as embedded
+    # noise. The LibreChat prompt path strips these too; this covers the embed
+    # path, which extracts the raw file independently. Cheap no-op when there are
+    # no data URIs (the function short-circuits on a "base64," membership check).
+    data = list(data)
+    for _doc in data:
+        _doc.page_content = strip_base64_images(_doc.page_content)
+
     if MARKDOWN_AWARE_CHUNKING and file_ext == "md":
         documents = _split_markdown_aware(data)
     else:
