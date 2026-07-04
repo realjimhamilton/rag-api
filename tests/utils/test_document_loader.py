@@ -4,7 +4,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.utils.document_loader import get_loader, clean_text, process_documents
+from app.utils.document_loader import (
+    get_loader,
+    clean_text,
+    strip_base64_images,
+    process_documents,
+)
 from langchain_community.document_loaders import (
     TextLoader,
     UnstructuredMarkdownLoader,
@@ -278,3 +283,35 @@ def test_get_loader_raw_text_respects_binary_extensions_over_markdown_mime(
     )
 
     assert type(loader).__name__ == expected_loader_name
+
+
+def test_strip_base64_markdown_image_keeps_alt():
+    text = "Intro ![a cat](data:image/png;base64,AAAABBBBCCCC==) end"
+    assert strip_base64_images(text) == "Intro [image: a cat] end"
+
+
+def test_strip_base64_markdown_image_no_alt():
+    assert strip_base64_images("![](data:image/jpeg;base64,ZZZZ) x") == "[image] x"
+
+
+def test_strip_base64_html_img():
+    text = 'a <img alt="x" src="data:image/gif;base64,QWER=="> b'
+    assert strip_base64_images(text) == "a [image] b"
+
+
+def test_strip_base64_bare_data_uri():
+    assert strip_base64_images("foo data:image/png;base64,MNOPQRST bar") == "foo [image] bar"
+
+
+def test_strip_base64_noop_when_no_data_uri():
+    text = "no images here, just words"
+    assert strip_base64_images(text) is text  # short-circuits, returns same object
+    assert strip_base64_images("") == ""
+    assert strip_base64_images(None) == ""
+
+
+def test_strip_base64_removes_large_blob_keeps_real_text():
+    big = "Real heading\n\n![logo](data:image/png;base64," + "A" * 50000 + ")\n\nReal body"
+    out = strip_base64_images(big)
+    assert "base64" not in out
+    assert "Real heading" in out and "Real body" in out and "[image: logo]" in out
