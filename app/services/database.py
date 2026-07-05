@@ -1,6 +1,6 @@
 # app/services/database.py
 import asyncpg
-from app.config import DSN, logger
+from app.config import DSN, logger, HYBRID_FTS_LANGUAGE
 
 
 class PSQLDatabase:
@@ -82,6 +82,23 @@ async def ensure_vector_indexes():
             CREATE INDEX IF NOT EXISTS ix_cmetadata_gin
             ON langchain_pg_embedding
             USING gin (cmetadata jsonb_path_ops);
+            """
+        )
+
+        # Functional GIN index for hybrid full-text search over the chunk text.
+        # Idempotent + additive: no column, no table rewrite, no ALTER lock —
+        # rollback is a single DROP INDEX. HYBRID_FTS_LANGUAGE is validated to a
+        # bare identifier at config import, so interpolating it as the regconfig
+        # literal is safe (a regconfig cannot be a bind parameter, and the index
+        # expression must match the query's to_tsvector('<lang>', document)
+        # exactly for the planner to use it). Created unconditionally (cheap at
+        # our scale) so hybrid works the moment the master flag OR a per-request
+        # `hybrid:true` turns it on, no restart needed.
+        await conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_langchain_pg_embedding_document_fts
+            ON langchain_pg_embedding
+            USING gin (to_tsvector('{HYBRID_FTS_LANGUAGE}', document));
             """
         )
 

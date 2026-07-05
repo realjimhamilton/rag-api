@@ -86,6 +86,29 @@ class AsyncPgVector(ExtendedPgVector):
             filter,
         )
 
+    async def ahybrid_search_with_score_by_vector(
+        self,
+        embedding: List[float],
+        query_text: str,
+        k: int = 4,
+        filter: Optional[Dict[str, Any]] = None,
+        lang: str = "english",
+        keyword_bonus: float = 0.35,
+        executor=None,
+    ) -> List[Tuple[Document, float]]:
+        """Async version of hybrid_search_with_score_by_vector."""
+        executor = executor or self._get_thread_pool()
+        return await self._run_in_executor(
+            executor,
+            super().hybrid_search_with_score_by_vector,
+            embedding,
+            query_text,
+            k,
+            filter,
+            lang,
+            keyword_bonus,
+        )
+
     async def aadd_documents(
         self,
         documents: List[Document],

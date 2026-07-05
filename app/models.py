@@ -31,6 +31,10 @@ class QueryRequestBody(BaseModel):
     file_id: str
     k: int = 4
     entity_id: Optional[str] = None
+    # Per-request override of HYBRID_SEARCH_ENABLED. None = defer to the env
+    # master switch; True/False force hybrid on/off for this call (lets the
+    # LibreChat side A/B by user without a second rag-api deployment).
+    hybrid: Optional[bool] = None
 
 
 class CleanupMethod(str, Enum):
@@ -42,6 +46,8 @@ class QueryMultipleBody(BaseModel):
     query: str
     file_ids: List[str]
     k: int = 4
+    # See QueryRequestBody.hybrid.
+    hybrid: Optional[bool] = None
 
 
 class ContextualizeRequestBody(BaseModel):
