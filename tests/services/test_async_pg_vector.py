@@ -75,6 +75,29 @@ async def test_asimilarity_search_passes_args(store):
 
 
 @pytest.mark.asyncio
+async def test_ahybrid_search_passes_args(store):
+    expected = [(Document(page_content="test", metadata={}), 0.35)]
+    with patch.object(
+        ExtendedPgVector,
+        "hybrid_search_with_score_by_vector",
+        return_value=expected,
+    ) as mock:
+        embedding = [0.1, 0.2, 0.3]
+        result = await store.ahybrid_search_with_score_by_vector(
+            embedding,
+            "some query",
+            k=5,
+            filter={"file_id": {"$eq": "id1"}},
+            lang="english",
+            keyword_bonus=0.35,
+        )
+    mock.assert_called_once_with(
+        embedding, "some query", 5, {"file_id": {"$eq": "id1"}}, "english", 0.35
+    )
+    assert result == expected
+
+
+@pytest.mark.asyncio
 async def test_aadd_documents_passes_args(store):
     docs = [Document(page_content="test", metadata={})]
     with patch.object(ExtendedPgVector, "add_documents", return_value=["id1"]) as mock:

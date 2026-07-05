@@ -54,6 +54,9 @@ from app.config import (
     MAX_CHUNKS_PER_CONTEXTUALIZE,
     MARKDOWN_AWARE_CHUNKING,
     MARKDOWN_HEADERS_TO_SPLIT_ON,
+    HYBRID_SEARCH_ENABLED,
+    HYBRID_FTS_LANGUAGE,
+    HYBRID_KEYWORD_BONUS,
 )
 from app.services.contextualizer import Contextualizer
 
@@ -68,10 +71,9 @@ from app.services.contextualizer import Contextualizer
 # (so non-numeric stale values don't break startup), which means the parsed
 # value is always None for Atlas — and relying on it would suppress the
 # warning we want operators to see.
-if (
-    VECTOR_DB_TYPE == VectorDBType.ATLAS_MONGO
-    and os.getenv("RAG_DISTANCE_THRESHOLD") not in (None, "")
-):
+if VECTOR_DB_TYPE == VectorDBType.ATLAS_MONGO and os.getenv(
+    "RAG_DISTANCE_THRESHOLD"
+) not in (None, ""):
     logger.warning(
         "RAG_DISTANCE_THRESHOLD is set but VECTOR_DB_TYPE=atlas-mongo; "
         "Atlas returns similarity scores (higher = better) which would "
@@ -92,6 +94,8 @@ def _apply_distance_threshold(documents):
     if VECTOR_DB_TYPE == VectorDBType.ATLAS_MONGO:
         return documents
     return [(doc, score) for doc, score in documents if score <= RAG_DISTANCE_THRESHOLD]
+
+
 from app.constants import ERROR_MESSAGES
 from app.models import (
     StoreDocument,
@@ -394,16 +398,40 @@ async def query_embeddings_by_file_id(
     try:
         embedding = get_cached_query_embedding(body.query)
 
+        # Per-request override wins; otherwise defer to the env master switch.
+        use_hybrid = body.hybrid if body.hybrid is not None else HYBRID_SEARCH_ENABLED
+        vec_filter = {"file_id": {"$eq": body.file_id}}
+
         if isinstance(vector_store, AsyncPgVector):
-            documents = await vector_store.asimilarity_search_with_score_by_vector(
+            if use_hybrid:
+                documents = await vector_store.ahybrid_search_with_score_by_vector(
+                    embedding,
+                    body.query,
+                    k=body.k,
+                    filter=vec_filter,
+                    lang=HYBRID_FTS_LANGUAGE,
+                    keyword_bonus=HYBRID_KEYWORD_BONUS,
+                    executor=request.app.state.thread_pool,
+                )
+            else:
+                documents = await vector_store.asimilarity_search_with_score_by_vector(
+                    embedding,
+                    k=body.k,
+                    filter=vec_filter,
+                    executor=request.app.state.thread_pool,
+                )
+        elif use_hybrid and hasattr(vector_store, "hybrid_search_with_score_by_vector"):
+            documents = vector_store.hybrid_search_with_score_by_vector(
                 embedding,
+                body.query,
                 k=body.k,
-                filter={"file_id": {"$eq": body.file_id}},
-                executor=request.app.state.thread_pool,
+                filter=vec_filter,
+                lang=HYBRID_FTS_LANGUAGE,
+                keyword_bonus=HYBRID_KEYWORD_BONUS,
             )
         else:
             documents = vector_store.similarity_search_with_score_by_vector(
-                embedding, k=body.k, filter={"file_id": {"$eq": body.file_id}}
+                embedding, k=body.k, filter=vec_filter
             )
 
         documents = _apply_distance_threshold(documents)
@@ -1264,17 +1292,40 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
         # Get the embedding of the query text
         embedding = get_cached_query_embedding(body.query)
 
+        use_hybrid = body.hybrid if body.hybrid is not None else HYBRID_SEARCH_ENABLED
+        vec_filter = {"file_id": {"$in": body.file_ids}}
+
         # Perform similarity search with the query embedding and filter by the file_ids in metadata
         if isinstance(vector_store, AsyncPgVector):
-            documents = await vector_store.asimilarity_search_with_score_by_vector(
+            if use_hybrid:
+                documents = await vector_store.ahybrid_search_with_score_by_vector(
+                    embedding,
+                    body.query,
+                    k=body.k,
+                    filter=vec_filter,
+                    lang=HYBRID_FTS_LANGUAGE,
+                    keyword_bonus=HYBRID_KEYWORD_BONUS,
+                    executor=request.app.state.thread_pool,
+                )
+            else:
+                documents = await vector_store.asimilarity_search_with_score_by_vector(
+                    embedding,
+                    k=body.k,
+                    filter=vec_filter,
+                    executor=request.app.state.thread_pool,
+                )
+        elif use_hybrid and hasattr(vector_store, "hybrid_search_with_score_by_vector"):
+            documents = vector_store.hybrid_search_with_score_by_vector(
                 embedding,
+                body.query,
                 k=body.k,
-                filter={"file_id": {"$in": body.file_ids}},
-                executor=request.app.state.thread_pool,
+                filter=vec_filter,
+                lang=HYBRID_FTS_LANGUAGE,
+                keyword_bonus=HYBRID_KEYWORD_BONUS,
             )
         else:
             documents = vector_store.similarity_search_with_score_by_vector(
-                embedding, k=body.k, filter={"file_id": {"$in": body.file_ids}}
+                embedding, k=body.k, filter=vec_filter
             )
 
         documents = _apply_distance_threshold(documents)
@@ -1406,9 +1457,7 @@ async def contextualize_file(
                 status_code=404, detail="File not found in vector store"
             )
 
-        already_done = sum(
-            1 for d in documents if d.metadata.get("is_contextualized")
-        )
+        already_done = sum(1 for d in documents if d.metadata.get("is_contextualized"))
         if already_done == len(documents):
             return {
                 "status": True,
@@ -1441,9 +1490,7 @@ async def contextualize_file(
             Document(page_content=d.page_content, metadata=d.metadata)
             for d in documents
         ]
-        contextualized = await ctx.contextualize_documents(
-            full_text, lc_docs, file_id
-        )
+        contextualized = await ctx.contextualize_documents(full_text, lc_docs, file_id)
 
         if isinstance(vector_store, AsyncPgVector):
             await vector_store.delete(ids=[file_id], executor=executor)
@@ -1515,13 +1562,9 @@ async def decontextualize_file(file_id: str, request: Request):
                 meta.pop("is_contextualized", None)
                 meta.pop("contextualized_at", None)
                 meta.pop("contextualizer_model", None)
-                restored.append(
-                    Document(page_content=original, metadata=meta)
-                )
+                restored.append(Document(page_content=original, metadata=meta))
             else:
-                restored.append(
-                    Document(page_content=d.page_content, metadata=meta)
-                )
+                restored.append(Document(page_content=d.page_content, metadata=meta))
 
         if restored_count == 0:
             return {
@@ -1539,9 +1582,7 @@ async def decontextualize_file(file_id: str, request: Request):
             )
         else:
             vector_store.delete(ids=[file_id])
-            vector_store.add_documents(
-                restored, ids=[file_id] * len(restored)
-            )
+            vector_store.add_documents(restored, ids=[file_id] * len(restored))
 
         return {
             "status": True,

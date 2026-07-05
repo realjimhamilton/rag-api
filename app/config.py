@@ -103,6 +103,7 @@ MARKDOWN_AWARE_CHUNKING = get_env_variable(
     "MARKDOWN_AWARE_CHUNKING", "True"
 ).lower() in ("true", "1", "yes", "on")
 
+
 # Header levels to treat as split boundaries. Comma-separated, in order of
 # nesting depth. Defaults to "H2,H3" — H1 is typically the document title
 # (not a section boundary) and H4+ is usually too fine-grained to justify
@@ -131,7 +132,8 @@ def _parse_md_headers(raw: str) -> list[tuple[str, str]]:
         elif token:
             logging.getLogger(__name__).warning(
                 "MARKDOWN_HEADERS_TO_SPLIT_ON: ignoring unknown header token %r "
-                "(expected one of H1-H6)", token,
+                "(expected one of H1-H6)",
+                token,
             )
     return out
 
@@ -150,7 +152,9 @@ CONTEXTUALIZER_MODEL = get_env_variable(
     "CONTEXTUALIZER_MODEL", "claude-haiku-4-5-20251001"
 )
 ANTHROPIC_API_KEY = get_env_variable("ANTHROPIC_API_KEY", "")
-CONTEXTUALIZER_API_KEY = get_env_variable("CONTEXTUALIZER_API_KEY", "") or ANTHROPIC_API_KEY
+CONTEXTUALIZER_API_KEY = (
+    get_env_variable("CONTEXTUALIZER_API_KEY", "") or ANTHROPIC_API_KEY
+)
 CONTEXTUALIZER_BASE_URL = get_env_variable("CONTEXTUALIZER_BASE_URL", None)
 CONTEXTUALIZER_MAX_CONCURRENCY = int(
     get_env_variable("CONTEXTUALIZER_MAX_CONCURRENCY", "5")
@@ -158,6 +162,45 @@ CONTEXTUALIZER_MAX_CONCURRENCY = int(
 MAX_CHUNKS_PER_CONTEXTUALIZE = int(
     get_env_variable("MAX_CHUNKS_PER_CONTEXTUALIZE", "200")
 )
+
+# Hybrid retrieval — fuse Postgres full-text (lexical) search with the pgvector
+# cosine search so exact keyword / template / brand / filename matches that
+# dense embeddings under-rank still surface. Master switch defaults off; the
+# /query + /query_multiple endpoints ALSO accept a per-request `hybrid` override
+# so the LibreChat side can A/B by user without a second deployment. See
+# app/services/vector_store/extended_pg_vector.py#hybrid_search_with_score_by_vector.
+HYBRID_SEARCH_ENABLED = get_env_variable("HYBRID_SEARCH_ENABLED", "False").lower() in (
+    "true",
+    "1",
+    "yes",
+    "on",
+)
+
+# Postgres text-search config (regconfig) used for BOTH to_tsvector and
+# websearch_to_tsquery. 'english' applies stemming + stopword removal (good
+# general recall); 'simple' favors exact-token matching. Validated to a bare
+# identifier because it is interpolated as a SQL literal — a regconfig cannot be
+# a bind parameter, and the functional FTS index expression must match the
+# query's regconfig exactly. An unknown-but-safe value would make Postgres raise
+# at query time (surfaced, not silent).
+_hybrid_fts_language_raw = get_env_variable("HYBRID_FTS_LANGUAGE", "english")
+if not _hybrid_fts_language_raw.replace("_", "").isalnum():
+    logging.getLogger(__name__).warning(
+        "HYBRID_FTS_LANGUAGE=%r is not a bare identifier; falling back to 'english'",
+        _hybrid_fts_language_raw,
+    )
+    HYBRID_FTS_LANGUAGE = "english"
+else:
+    HYBRID_FTS_LANGUAGE = _hybrid_fts_language_raw
+
+# Additive relevance bonus for a full-text (keyword) match, scaled by the
+# chunk's RANK POSITION among a file's keyword hits: bonus = KEYWORD_BONUS / pos
+# (best match +KEYWORD_BONUS, 2nd +KEYWORD_BONUS/2, ...). Rank-based, not
+# raw-ts_rank-scaled, because ts_rank magnitudes are uncalibrated. The bonus is
+# added on top of cosine relevance (1 - distance) and the sum is capped at 1, so
+# a chunk with NO keyword match scores exactly as pure-vector does (non-keyword
+# queries are byte-for-byte unchanged — clean A/B).
+HYBRID_KEYWORD_BONUS = float(get_env_variable("HYBRID_KEYWORD_BONUS", "0.35"))
 
 # Batch processing configuration for memory-constrained environments.
 # When EMBEDDING_BATCH_SIZE > 0, documents are processed in batches to reduce
